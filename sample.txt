@@ -1,1 +1,1 @@
-This file contains sample content for testing purposes.
+This is a sample file created for testing purposes.
