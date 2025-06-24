@@ -1,50 +1,23 @@
-#!/usr/bin/env python3
-"""
-ETL Pipeline for migrating data from a MySQL database to a MongoDB database.
-
-Design and implementation details:
- - Adheres to SOLID principles: Each stage of the pipeline is separated into its own class.
- - Uses pymysql for MySQL extraction and pymongo for MongoDB loading.
- - Includes robust error handling with logging for both positive and negative scenarios.
- - Modular design: New transformations, extraction queries, and load strategies can be added easily.
- - Supports ideas for incremental migration, rollback and unit/integration testing via isolated components.
-
-Usage:
-    python pipeline_new.py
-
-Requirements:
-    pip install pymysql pymongo
-
-Note: This example demonstrates the migration process for a subset of tables (e.g., activation codes and incentive overrides).
-"""
-
+import pymysql
+import pymongo
+from bson.objectid import ObjectId
 import logging
-import sys
-import traceback
 from datetime import datetime
 
-import pymysql
-from pymongo import MongoClient, errors
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('etl_pipeline.log')
-    ]
-)
-
-
-class MySQLConnector:
-    """Handles MySQL connection and query execution."""
-
-    def __init__(self, host, user, password, database, port=3306):
+# ---------------------------------------------------------
+# MySQL Extractor Class
+# ---------------------------------------------------------
+class MySQLExtractor:
+    """
+    Responsible for connecting to MySQL and extracting data.
+    Follows Single Responsibility (extract data from MySQL) and is reusable.
+    """
+    def __init__(self, host, user, password, db, port=3306):
         self.host = host
         self.user = user
         self.password = password
-        self.database = database
+        self.db = db
         self.port = port
         self.connection = None
 
@@ -54,209 +27,211 @@ class MySQLConnector:
                 host=self.host,
                 user=self.user,
                 password=self.password,
-                database=self.database,
+                database=self.db,
                 port=self.port,
                 cursorclass=pymysql.cursors.DictCursor
             )
             logging.info('Connected to MySQL database.')
         except Exception as e:
-            logging.error(f'Error connecting to MySQL: {e}')
+            logging.error('MySQL connection error: %s', e)
             raise
 
-    def disconnect(self):
+    def fetch_all(self, query):
+        if self.connection is None:
+            self.connect()
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(query)
+                results = cursor.fetchall()
+                logging.info('Extracted %d records for query: %s', len(results), query)
+                return results
+        except Exception as e:
+            logging.error('Error fetching data: %s', e)
+            raise
+
+    def close(self):
         if self.connection:
             self.connection.close()
             logging.info('MySQL connection closed.')
 
-    def execute_query(self, query, params=None):
-        """Execute a query and return all rows."""
+
+# ---------------------------------------------------------
+# Transformer Class
+# ---------------------------------------------------------
+class Transformer:
+    """
+    Responsible for transforming MySQL data rows to MongoDB documents.
+    Handles type conversion (e.g., INT to ObjectId, DATETIME to Date), field mappings,
+    and relationship handling (e.g., embedding order items) based on mapping documents.
+    """
+    def __init__(self):
+        # Mapping dictionaries for maintaining foreign key references
+        self.user_id_map = {}
+        self.product_id_map = {}
+        self.order_id_map = {}
+
+    def transform_user(self, user_row):
+        # Generate ObjectId for user. In a real scenario, you might maintain consistency with original ID
+        new_id = ObjectId()
+        self.user_id_map[user_row['id']] = new_id
+        transformed = {
+            '_id': new_id,
+            'username': user_row.get('username'),
+            'email': user_row.get('email'),
+            'password': user_row.get('password'),
+            'created_at': user_row.get('created_at') or datetime.utcnow()
+        }
+        return transformed
+
+    def transform_product(self, product_row):
+        new_id = ObjectId()
+        self.product_id_map[product_row['id']] = new_id
+        transformed = {
+            '_id': new_id,
+            'name': product_row.get('name'),
+            'description': product_row.get('description'),
+            'price': float(product_row.get('price')) if product_row.get('price') else 0.0,
+            'created_at': product_row.get('created_at') or datetime.utcnow()
+        }
+        return transformed
+
+    def transform_order(self, order_row, order_items):
+        new_id = ObjectId()
+        self.order_id_map[order_row['id']] = new_id
+        # Convert user_id from MySQL integer to corresponding ObjectId
+        user_obj_id = self.user_id_map.get(order_row.get('user_id'))
+        if not user_obj_id:
+            logging.warning('User ID %s not found in mapping for order %s', order_row.get('user_id'), order_row.get('id'))
+        # Process embedded order items
+        items = []
+        for item in order_items:
+            product_obj_id = self.product_id_map.get(item.get('product_id'))
+            if not product_obj_id:
+                logging.warning('Product ID %s not found in mapping for order item in order %s', item.get('product_id'), order_row.get('id'))
+            items.append({
+                'product_id': product_obj_id,
+                'quantity': item.get('quantity', 1)
+            })
+        transformed = {
+            '_id': new_id,
+            'user_id': user_obj_id,
+            'order_date': order_row.get('order_date') or datetime.utcnow(),
+            'order_items': items
+        }
+        return transformed
+
+
+# ---------------------------------------------------------
+# Mongo Loader Class
+# ---------------------------------------------------------
+class MongoLoader:
+    """
+    Responsible for loading transformed documents into MongoDB.
+    Encapsulates insertion logic and batch operations.
+    """
+    def __init__(self, uri, db_name):
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute(query, params)
-                result = cursor.fetchall()
-                logging.info(f'Executed query: {query}')
-                return result
-        except Exception as e:
-            logging.error(f'Error executing query: {query}. Error: {e}')
-            raise
-
-
-class MongoDBConnector:
-    """Handles MongoDB connection and data insertion operations."""
-
-    def __init__(self, uri, database):
-        self.uri = uri
-        self.database_name = database
-        self.client = None
-        self.db = None
-
-    def connect(self):
-        try:
-            self.client = MongoClient(self.uri)
-            self.db = self.client[self.database_name]
+            self.client = pymongo.MongoClient(uri)
+            self.db = self.client[db_name]
             logging.info('Connected to MongoDB.')
-        except errors.PyMongoError as e:
-            logging.error(f'Error connecting to MongoDB: {e}')
+        except Exception as e:
+            logging.error('MongoDB connection error: %s', e)
             raise
 
-    def disconnect(self):
-        if self.client:
-            self.client.close()
-            logging.info('MongoDB connection closed.')
-
-    def insert_documents(self, collection_name, documents, batch_size=1000):
-        """Insert a list of documents into the given collection in batches."""
+    def load_collection(self, collection_name, documents):
         if not documents:
-            logging.info(f'No documents to insert into collection {collection_name}.' )
+            logging.info('No documents to load into %s.', collection_name)
             return
-        collection = self.db[collection_name]
         try:
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i+batch_size]
-                collection.insert_many(batch, ordered=False)
-                logging.info(f'Inserted batch {i//batch_size + 1} into collection {collection_name}.')
-        except errors.BulkWriteError as bwe:
-            logging.error(f'Bulk write error in collection {collection_name}: {bwe.details}')
-            # Optionally implement rollback mechanisms or record failures
+            result = self.db[collection_name].insert_many(documents)
+            logging.info('Inserted %d documents into the %s collection.', len(result.inserted_ids), collection_name)
         except Exception as e:
-            logging.error(f'Error inserting documents into collection {collection_name}: {e}')
+            logging.error('Error inserting documents into %s: %s', collection_name, e)
             raise
 
 
-class DataTransformer:
-    """Transforms raw MySQL rows to MongoDB document format based on mapping rules."""
-
-    def transform_activation_code_incentive_override(self, row):
-        """Transforms MySQL row from activation_code_incentive_overrides to MongoDB document."""
-        try:
-            document = {
-                # In MongoDB, _id is normally generated automatically, but if needed you can map it.
-                # 'activation_code_id' should be converted to ObjectId if available from lookup.
-                # For this example, we assume the transformation of foreign keys are handled externally.
-                'activation_code_id': row.get('activation_code_id'),
-                'amount': row.get('amount'),
-                'created_at': row.get('created_at'),
-                'updated_at': row.get('updated_at')
-            }
-            return document
-        except Exception as e:
-            logging.error(f'Error transforming row {row}: {e}')
-            raise
-
-    def transform_activation_code_replacement(self, row):
-        """Transforms MySQL row from activation_code_replacements to MongoDB document."""
-        try:
-            document = {
-                'new_code_id': row.get('new_code_id'),
-                'old_code_id': row.get('old_code_id'),
-                'origin': row.get('origin'),
-                'clearing_house': row.get('clearing_house'),
-                'created_at': row.get('created_at'),
-                'updated_at': row.get('updated_at')
-            }
-            return document
-        except Exception as e:
-            logging.error(f'Error transforming row {row}: {e}')
-            raise
-
-    # Additional transformation methods for other tables/collections can be defined here.
-
-
+# ---------------------------------------------------------
+# Main Pipeline Class
+# ---------------------------------------------------------
 class ETLPipeline:
-    """Orchestrates the ETL process: extraction from MySQL, transformation, and loading to MongoDB."""
+    """
+    Orchestrates the ETL process: extraction, transformation, and loading.
+    This class integrates the responsibilities of extraction, transformation, and loading,
+    and adheres to SOLID principles by delegating responsibilities to dedicated classes.
+    """
+    def __init__(self, mysql_config, mongo_uri, mongo_db_name):
+        self.mysql_extractor = MySQLExtractor(**mysql_config)
+        self.mongo_loader = MongoLoader(mongo_uri, mongo_db_name)
+        self.transformer = Transformer()
 
-    def __init__(self, mysql_connector, mongodb_connector, transformer):
-        self.mysql = mysql_connector
-        self.mongodb = mongodb_connector
-        self.transformer = transformer
-
-    def migrate_activation_code_incentive_overrides(self):
-        """Migrate data for activation_code_incentive_overrides table to activationCodeIncentiveOverrides collection."""
-        query = "SELECT id, activation_code_id, amount, created_at, updated_at FROM activation_code_incentive_overrides"
+    def run(self):
         try:
-            rows = self.mysql.execute_query(query)
-            logging.info(f'Extracted {len(rows)} rows from activation_code_incentive_overrides')
-            documents = []
-            for row in rows:
-                try:
-                    doc = self.transformer.transform_activation_code_incentive_override(row)
-                    documents.append(doc)
-                except Exception as e:
-                    # Log and continue with next row
-                    logging.error(f'Error transforming row with id {row.get("id")}: {e}')
-            self.mongodb.insert_documents('activationCodeIncentiveOverrides', documents)
-        except Exception as e:
-            logging.error(f'Error in migrating activation_code_incentive_overrides: {e}')
-            traceback.print_exc()
+            # Extract data from MySQL
+            logging.info('Beginning extraction phase.')
+            users = self.mysql_extractor.fetch_all('SELECT * FROM users')
+            products = self.mysql_extractor.fetch_all('SELECT * FROM products')
+            orders = self.mysql_extractor.fetch_all('SELECT * FROM orders')
+            order_items_all = self.mysql_extractor.fetch_all('SELECT * FROM order_items')
+            logging.info('Extraction complete.')
 
-    def migrate_activation_code_replacements(self):
-        """Migrate data for activation_code_replacements table to activationCodeReplacements collection."""
-        query = "SELECT id, new_code_id, old_code_id, origin, clearing_house, created_at, updated_at FROM activation_code_replacements"
-        try:
-            rows = self.mysql.execute_query(query)
-            logging.info(f'Extracted {len(rows)} rows from activation_code_replacements')
-            documents = []
-            for row in rows:
-                try:
-                    doc = self.transformer.transform_activation_code_replacement(row)
-                    documents.append(doc)
-                except Exception as e:
-                    logging.error(f'Error transforming row with id {row.get("id")}: {e}')
-            self.mongodb.insert_documents('activationCodeReplacements', documents)
-        except Exception as e:
-            logging.error(f'Error in migrating activation_code_replacements: {e}')
-            traceback.print_exc()
+            # Pre-processing: Group order_items by order_id
+            order_items_group = {}
+            for item in order_items_all:
+                order_id = item.get('order_id')
+                order_items_group.setdefault(order_id, []).append(item)
 
-    def run_all(self):
-        """Runs all migration steps."""
-        logging.info('Starting ETL pipeline...')
-        try:
-            self.migrate_activation_code_incentive_overrides()
-            self.migrate_activation_code_replacements()
-            # Add additional migration function calls here
-            logging.info('ETL pipeline finished successfully.')
+            # Transform data
+            logging.info('Beginning transformation phase.')
+            transformed_users = []
+            for user in users:
+                transformed_users.append(self.transformer.transform_user(user))
+
+            transformed_products = []
+            for product in products:
+                transformed_products.append(self.transformer.transform_product(product))
+
+            transformed_orders = []
+            for order in orders:
+                items = order_items_group.get(order.get('id'), [])
+                transformed_orders.append(self.transformer.transform_order(order, items))
+
+            logging.info('Transformation complete.')
+
+            # Load data into MongoDB
+            logging.info('Beginning loading phase.')
+            self.mongo_loader.load_collection('users', transformed_users)
+            self.mongo_loader.load_collection('products', transformed_products)
+            self.mongo_loader.load_collection('orders', transformed_orders)
+            logging.info('Loading complete.')
+
         except Exception as e:
-            logging.error(f'Error running ETL pipeline: {e}')
-            traceback.print_exc()
-            # Optionally implement rollback mechanisms here
+            logging.error('ETL Pipeline encountered an error: %s', e)
+            # Depending on the requirement, implement rollback or alerting mechanisms here
+            raise
+        finally:
+            self.mysql_extractor.close()
 
 
 def main():
-    # MySQL connection configuration
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # MySQL configuration parameters (Update with actual credentials and database)
     mysql_config = {
         'host': 'localhost',
-        'user': 'your_mysql_user',
+        'user': 'root',
         'password': 'your_mysql_password',
-        'database': 'your_mysql_database',
+        'db': 'your_mysql_db',
         'port': 3306
     }
 
-    # MongoDB connection configuration
-    mongodb_config = {
-        'uri': 'mongodb://localhost:27017',
-        'database': 'your_mongo_database'
-    }
+    # MongoDB configuration (Update with actual connection details)
+    mongo_uri = 'mongodb://localhost:27017/'
+    mongo_db_name = 'your_mongo_db'
 
-    # Instantiate connectors
-    mysql_conn = MySQLConnector(**mysql_config)
-    mongodb_conn = MongoDBConnector(mongodb_config['uri'], mongodb_config['database'])
-
-    try:
-        mysql_conn.connect()
-        mongodb_conn.connect()
-    except Exception as e:
-        logging.error('Failed to connect to one of the databases. Exiting.')
-        sys.exit(1)
-
-    transformer = DataTransformer()
-    etl = ETLPipeline(mysql_conn, mongodb_conn, transformer)
-
-    # Run the ETL process
-    etl.run_all()
-
-    # Clean up connections
-    mysql_conn.disconnect()
-    mongodb_conn.disconnect()
+    # Initialize and run the ETL pipeline
+    pipeline = ETLPipeline(mysql_config, mongo_uri, mongo_db_name)
+    pipeline.run()
 
 
 if __name__ == '__main__':
